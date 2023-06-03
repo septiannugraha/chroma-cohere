@@ -6,27 +6,77 @@ from cohere.responses.classify import Example
 import pprint
 from halo import Halo
 from colorama import Fore, Style, init
+import chromadb
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
+import pandas as pd
+
 
 load_dotenv()  # This loads environment variables from a .env file, which is good for sensitive info like API keys
 
-pp = pprint.PrettyPrinter(indent=4)  # PrettyPrinter makes dictionary output easier to read
+# PrettyPrinter makes dictionary output easier to read
+pp = pprint.PrettyPrinter(indent=4)
 
 
+# Initializes the Cohere API key from the environment variables. Raises an error if the key isn't found.
 COHERE_KEY = os.getenv("COHERE_KEY")
 if COHERE_KEY is None:
     raise ValueError("Cohere API key not found in the environment variables.")
 
+# Initializes the ChromaDB client with certain settings. These settings specify that the client should use DuckDB with Parquet for storage, 
+# and it should store its data in a directory named 'database'.
+chroma_client = chromadb.Client(Settings(
+    chroma_db_impl="duckdb+parquet",
+    persist_directory="database"
+))
+
+# Initializes a CohereEmbeddingFunction, which is a specific function that generates embeddings using the Cohere model.
+# These embeddings will be used to add and retrieve examples in the ChromaDB database.
+cohere_ef = embedding_functions.CohereEmbeddingFunction(
+    api_key=COHERE_KEY,  model_name=os.getenv('COHERE_MODEL_NAME')
+)
+
+# Gets or creates a ChromaDB collection named 'help_desk', using the Cohere embedding function.
+example_collection = chroma_client.get_or_create_collection(
+    name="help_desk", embedding_function=cohere_ef)
+
+# Reads the CSV data into pandas DataFrames.
+df_department = pd.read_csv('training_data_department.csv')
+df_mood = pd.read_csv('training_data_mood.csv')
+
+# Converts the DataFrames to lists of dictionaries.
+department_dict = df_department.to_dict('records')
+mood_dict = df_mood.to_dict('records')
+
+# If the number of examples in the collection is less than the number of examples in the department data,
+# adds the examples to the collection.
+if example_collection.count() < len(department_dict):
+    for id, item in enumerate(department_dict):
+        index = example_collection.count() if example_collection.count() is not None else 0
+        example_collection.add(
+            documents=[item['text']],
+            metadatas=[{"department": item['label'],
+                        "mood": mood_dict[id]['label']}],
+            ids=[f"id_{index}"]
+        )
+
+#  Creates the function generate_response. This function takes a list of messages, generates a response using the Cohere API,
+# classifies the mood and department using the examples in the ChromaDB collection, and then returns the messages, mood, and department.
 def generate_response(messages):
-    spinner = Halo(text='Loading...', spinner='dots')  # Creates a loading animation
+    # Creates a loading animation
+    spinner = Halo(text='Loading...', spinner='dots')
     spinner.start()
 
-    co = cohere.Client(COHERE_KEY)  # Initializes the Cohere API client with your API key
+    # Initializes the Cohere API client with your API key
+    co = cohere.Client(COHERE_KEY)
 
+    # Gets the mood and department classifications for the messages.
     mood = get_mood_classification(messages, co)
     department = get_department_classification(messages, co)
 
     spinner.stop()  # Stops the loading animation after receiving the response
 
+    # Defines a priority level for each mood.
     mood_priority = {
         'Despair': 1,
         'Sorrowful': 2,
@@ -48,107 +98,41 @@ def generate_response(messages):
 
     return messages, mood, department
 
+
+# Two helper functions to get mood and department classification. They query examples from the ChromaDB collection,
+# send a classification request to the Cohere API, and extract the prediction from the response.
 def get_department_classification(messages, co):
-    department_examples = [
-        Example("How do I recharge my energy beam?", "Equipment Maintenance"),
-        Example("How can I manage the collateral damage from my powers?",
-                "City Relations"),
-        Example("Can you assist me with writing a speech for the mayor's ceremony?",
-                "Public Relations"),
-        Example("Is there a special way to activate my stealth mode?",
-                "Equipment Maintenance"),
-        Example("What are the current laws regarding secret identities?", "Legal"),
-        Example("There's a massive tornado headed for the city, what's our plan?",
-                "Emergency Response"),
-        Example("I pulled a muscle while lifting a car, what should I do?", "Medical"),
-        Example("My superhero suit is damaged, can you help me fix it?",
-                "Equipment Maintenance"),
-        Example(
-            "I need training for underwater missions, who can help me?", "Training"),
-        Example("What should I say to the press about my recent rescue operation?",
-                "Public Relations"),
-        Example("How do I handle paperwork for the arrested supervillain?", "Legal"),
-        Example(
-            "I'm feeling overwhelmed with this superhero life, what should I do?", "Mental Health"),
-        Example("How do I track the invisible villain?", "Intelligence"),
-        Example(
-            "I've been exposed to a new kind of radiation, do you have any info about this?", "Medical"),
-        Example("My communication device is not working, how do I fix it?",
-                "Equipment Maintenance"),
-        Example(
-            "How can I improve my relations with the local police department?", "City Relations"),
-        Example(
-            "My speed isn't improving, can you help me figure out a new training plan?", "Training"),
-        Example("What's our protocol for inter-dimensional threats?",
-                "Emergency Response"),
-        Example("A civilian saw me without my mask, what should I do?", "Legal"),
-        Example("How do I maintain my gear to ensure it doesn't fail during missions?",
-                "Equipment Maintenance"),
-        Example(
-            "I can't shake off the guilt after failing a mission, what should I do?", "Mental Health"),
-        Example(
-            "The villain seems to know my every move, do we have a mole?", "Intelligence"),
-        Example(
-            "I'm having nightmares about past battles, can someone help?", "Mental Health"),
-        Example("How can we predict the villain's next move?", "Intelligence"),
-        Example(
-            "I'm struggling to balance my civilian life and superhero duties, any advice?", "Mental Health")
-    ]
+
+    department_examples = []
+    results = example_collection.query(
+        query_texts=[messages],
+        n_results=90
+    )
+
+    for doc, md in zip(results['documents'][0], results['metadatas'][0]):
+        department_examples.append(Example(doc, md['department']))
 
     department_response = co.classify(
-        model='large',
+        model=os.getenv("COHERE_MODEL_NAME"),
         inputs=[messages],
         examples=department_examples
     )  # Sends the classification request to the Cohere model
 
-    department = department_response.classifications[0].prediction  # Extracts the prediction from the response
+    # Extracts the prediction from the response
+    department = department_response.classifications[0].prediction
     return department
 
+
 def get_mood_classification(messages, co):
-    mood_examples = [
-        Example("How do I recharge my energy beam?", "Neutral"),
-        Example(
-            "How can I manage the collateral damage from my powers?", "Anxious"),
-        Example(
-            "Can you assist me with writing a speech for the mayor's ceremony?", "Joyful"),
-        Example("Is there a special way to activate my stealth mode?", "Neutral"),
-        Example("What are the current laws regarding secret identities?", "Neutral"),
-        Example(
-            "There's a massive tornado headed for the city, what's our plan?", "Anxious"),
-        Example(
-            "I pulled a muscle while lifting a car, what should I do?", "Sorrowful"),
-        Example("My superhero suit is damaged, can you help me fix it?", "Frustrated"),
-        Example(
-            "I need training for underwater missions, who can help me?", "Satisfied"),
-        Example(
-            "What should I say to the press about my recent rescue operation?", "Joyful"),
-        Example(
-            "How do I handle paperwork for the arrested supervillain?", "Irritated"),
-        Example(
-            "I'm feeling overwhelmed with this superhero life, what should I do?", "Despair"),
-        Example("How do I track the invisible villain?", "Frustrated"),
-        Example(
-            "I've been exposed to a new kind of radiation, do you have any info about this?", "Sorrowful"),
-        Example(
-            "My communication device is not working, how do I fix it?", "Irritated"),
-        Example(
-            "How can I improve my relations with the local police department?", "Satisfied"),
-        Example(
-            "My speed isn't improving, can you help me figure out a new training plan?", "Joyful"),
-        Example("What's our protocol for inter-dimensional threats?", "Despair"),
-        Example("A civilian saw me without my mask, what should I do?", "Anxious"),
-        Example(
-            "How do I maintain my gear to ensure it doesn't fail during missions?", "Neutral"),
-        Example(
-            "I can't shake off the guilt after failing a mission, what should I do?", "Sorrowful"),
-        Example(
-            "The villain seems to know my every move, do we have a mole?", "Frustrated"),
-        Example(
-            "I'm having nightmares about past battles, can someone help?", "Despair"),
-        Example("How can we predict the villain's next move?", "Anxious"),
-        Example(
-            "I'm struggling to balance my civilian life and superhero duties, any advice?", "Satisfied")
-    ]
+
+    mood_examples = []
+    results = example_collection.query(
+        query_texts=[messages],
+        n_results=90
+    )
+
+    for doc, md in zip(results['documents'][0], results['metadatas'][0]):
+        mood_examples.append(Example(doc, md['mood']))
 
     mood_response = co.classify(
         model=os.getenv("COHERE_MODEL_NAME"),
@@ -156,12 +140,18 @@ def get_mood_classification(messages, co):
         examples=mood_examples
     )  # Sends the classification request to the Cohere model
 
-    mood = mood_response.classifications[0].prediction  # Extracts the prediction from the response
+    # Extracts the prediction from the response
+    mood = mood_response.classifications[0].prediction
     return mood
 
+
 def main():
+    # A message to inform the user that they can type 'quit' to end the conversation.
     print("Type 'quit' at any time to end the conversation.")
-    while True:  # This infinite loop asks for user input and generates responses until the user types 'quit'.
+
+    # An infinite loop that prompts the user for input, generates a response, and adds the response to the ChromaDB collection.
+    # The loop breaks when the user types 'quit'.
+    while True:
         input_text = input("You: ")
 
         if input_text.lower() == "quit":
@@ -170,6 +160,16 @@ def main():
 
         response, mood, department = generate_response(input_text)
 
+
+        # Adds the response to the ChromaDB collection.
+        index = example_collection.count() if example_collection.count() is not None else 0
+        example_collection.add(
+            documents=[response],
+            metadatas=[{"department": department,
+                        "mood": mood}],
+            ids=[f"id_{index}"]
+        )
+
+
 if __name__ == "__main__":  # Ensures that the main function only runs if this script is the main entry point. If this script is imported by another script, the main function won't automatically run.
     main()
-
